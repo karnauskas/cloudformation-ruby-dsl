@@ -4,7 +4,7 @@ require 'json'
 
 # Formats a template as JSON
 def generate_template(template)
-  format_json template, !template.nopretty
+  generate_json template, !template.nopretty
 end
 
 def generate_json(data, pretty = true)
@@ -67,7 +67,8 @@ class TemplateDSL < JsonObjectDSL
               :aws_region,
               :nopretty,
               :stack_name,
-              :aws_profile
+              :aws_profile,
+              :s3_bucket
 
   def initialize(options)
     @parameters  = options.fetch(:parameters, {})
@@ -76,6 +77,7 @@ class TemplateDSL < JsonObjectDSL
     @aws_region  = options.fetch(:region, default_region)
     @aws_profile = options[:profile]
     @nopretty    = options.fetch(:nopretty, false)
+    @s3_bucket   = options.fetch(:s3_bucket, nil)
     super()
   end
 

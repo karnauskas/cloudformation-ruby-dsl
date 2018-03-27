@@ -31,7 +31,7 @@ require 'highline/import'
 
 ############################# AWS SDK Support
 
-class AwsCfn
+class AwsClients
   attr_accessor :cfn_client_instance
 
   def initialize(args)
@@ -57,6 +57,13 @@ class AwsCfn
       )
     end
     @cfn_client_instance
+  end
+
+  def s3_client
+    if @s3_client_instance == nil
+      @s3_client_instance = Aws::S3::Client.new()
+    end
+    @s3_client_instance
   end
 end
 
@@ -85,13 +92,14 @@ def parse_args
     :region      => default_region,
     :profile     => nil,
     :nopretty    => false,
+    :s3_bucket   => nil,
   }
   ARGV.slice_before(/^--/).each do |name, value|
     case name
     when '--stack-name'
       args[:stack_name] = value
     when '--parameters'
-      args[:parameters] = Hash[value.split(/;/).map { |pair| parts = pair.split(/=/, 2); [ parts[0], Parameter.new(parts[1]) ] }]  #/# fix for syntax highlighting
+      args[:parameters] = Hash[value.split(/;/).map { |pair| parts = pair.split(/=/, 2); [ parts[0], Parameter.new(parts[1]) ] }]
     when '--interactive'
       args[:interactive] = true
     when '--region'
@@ -100,6 +108,8 @@ def parse_args
       args[:profile] = value
     when '--nopretty'
       args[:nopretty] = true
+    when '--s3-bucket'
+      args[:s3_bucket] = value
     end
   end
 
@@ -151,8 +161,9 @@ def validate_action(action)
 end
 
 def cfn(template)
-  aws_cfn = AwsCfn.new({:region => template.aws_region, :aws_profile => template.aws_profile})
-  cfn_client = aws_cfn.cfn_client
+  aws_clients = AwsClients.new({:region => template.aws_region, :aws_profile => template.aws_profile})
+  cfn_client = aws_clients.cfn_client
+  s3_client = aws_clients.s3_client
 
   action = validate_action( ARGV[0] )
 
@@ -170,14 +181,10 @@ def cfn(template)
 
   cfn_tags.each {|k, v| cfn_tags[k] = v[:Value].to_s}
 
-  if action == 'diff' or (action == 'expand' and not template.nopretty)
-    template_string = JSON.pretty_generate(template)
-  else
-    template_string = JSON.generate(template)
-  end
+  template_string = generate_template(template)
 
   # Derive stack name from ARGV
-  _, options = extract_options(ARGV[1..-1], %w(--nopretty), %w(--profile --stack-name --region --parameters --tag))
+  _, options = extract_options(ARGV[1..-1], %w(--nopretty), %w(--profile --stack-name --region --parameters --tag --s3-bucket))
   # If the first argument is not an option and stack_name is undefined, assume it's the stack name
   # The second argument, if present, is the resource name used by the describe-resource command
   if template.stack_name.nil?
@@ -222,7 +229,7 @@ Make the resulting file executable (`chmod +x [NEW_NAME.rb]`). It can respond to
 - `get-template`: get entire template output of an existing stack
 
 Command line options similar to cloudformation commands, but parsed by the dsl.
- --profile --stack-name --region --parameters --tag
+ --profile --stack-name --region --parameters --tag --s3-bucket
 
 Any other parameters are passed directly onto cloudformation. (--disable-rollback for instance)
 
@@ -237,12 +244,7 @@ template.rb create --stack-name my_stack --parameters "BucketName=bucket-s3-stat
   when 'expand'
     # Write the pretty-printed JSON template to stdout and exit.  [--nopretty] option writes output with minimal whitespace
     # example: <template.rb> expand --parameters "Env=prod" --region eu-west-1 --nopretty
-    if template.nopretty
-      puts template_string
-    else
-      puts template_string
-    end
-    exit(true)
+    template_string
 
   when 'diff'
     # example: <template.rb> diff my-stack-name --parameters "Env=prod" --region eu-west-1
@@ -332,7 +334,28 @@ template.rb create --stack-name my_stack --parameters "BucketName=bucket-s3-stat
 
   when 'validate'
     begin
-      valid = cfn_client.validate_template({template_body: template_string})
+      validation_payload = {}
+      if template.s3_bucket.nil? then
+        validation_payload = {template_body: template_string}
+      else
+        template_path = "#{Time.now.strftime("%s")}/#{stack_name}.json"
+        # assumption: JSON is the only supported serialization format (YAML not allowed)
+        template_url = "https://s3.amazonaws.com/#{template.s3_bucket}/#{template_path}"
+        begin
+          s3_client.put_object({
+            bucket: template.s3_bucket,
+            key: template_path,
+            # canned ACL for authorized users to read the bucket (that should be *this* IAM role!)
+            acl: "private",
+            body: template_string,
+          })
+        rescue Aws::S3::Errors::ServiceError => e
+          $stderr.puts "Failed to upload stack template to S3: #{e}"
+          exit(false)
+        end
+        validation_payload = {template_url: template_url}
+      end
+      valid = cfn_client.validate_template(validation_payload)
       if valid.successful?
         puts "Validation successful"
         exit(true)
@@ -351,11 +374,33 @@ template.rb create --stack-name my_stack --parameters "BucketName=bucket-s3-stat
       # default options (not overridable)
       create_stack_opts = {
           stack_name: stack_name,
-          template_body: template_string,
           parameters: template.parameters.map { |k,v| {parameter_key: k, parameter_value: v}}.to_a,
           tags: cfn_tags.map { |k,v| {"key" => k.to_s, "value" => v} }.to_a,
           capabilities: ["CAPABILITY_NAMED_IAM"],
       }
+
+      # If the user supplied the --s3-bucket option and
+      # access to the bucket, upload the template body to S3
+      if template.s3_bucket.nil? then
+        create_stack_opts["template_body"] = template_string
+      else
+        template_path = "#{Time.now.strftime("%s")}/#{stack_name}.json"
+        # assumption: JSON is the only supported serialization format (YAML not allowed)
+        template_url = "https://s3.amazonaws.com/#{template.s3_bucket}/#{template_path}"
+        begin
+          s3_client.put_object({
+            bucket: template.s3_bucket,
+            key: template_path,
+            # canned ACL for authorized users to read the bucket (that should be *this* IAM role!)
+            acl: "private",
+            body: template_string,
+          })
+        rescue Aws::S3::Errors::ServiceError => e
+          $stderr.puts "Failed to upload stack template to S3: #{e}"
+          exit(false)
+        end
+        create_stack_opts["template_url"] = template_url
+      end
 
       # fill in options from the command line
       extra_options = parse_arg_array_as_hash(options)
@@ -563,11 +608,28 @@ template.rb create --stack-name my_stack --parameters "BucketName=bucket-s3-stat
       # default options (not overridable)
       update_stack_opts = {
           stack_name: stack_name,
-          template_body: template_string,
           parameters: template.parameters.map { |k,v| (v.use_previous_value && old_parameters.include?([k,v])) ? {parameter_key: k, use_previous_value: v.use_previous_value.to_s} : {parameter_key: k, parameter_value: v}}.to_a,
           tags: cfn_tags.map { |k,v| {"key" => k.to_s, "value" => v.to_s} }.to_a,
           capabilities: ["CAPABILITY_NAMED_IAM"],
       }
+
+      # if the the user supplies a bucket bucket and
+      # access to it, upload the template body
+      if template.s3_bucket.nil? then
+        update_stack_opts["template_body"] = template_string
+      else
+        template_path = "#{Time.now.strftime("%s")}/#{stack_name}.json"
+        # assumption: JSON is the only supported serialization format (YAML not allowed)
+        template_url = "https://s3.amazonaws.com/#{template.s3_bucket}/#{template_path}"
+        s3_client.put_object({
+          bucket: template.s3_bucket,
+          key: template_path,
+          # canned ACL for authorized users to read the bucket (that should be *this* IAM role!)
+          acl: "private",
+          body: template_string,
+        })
+        update_stack_opts["template_url"] = template_url
+      end
 
       # fill in options from the command line
       extra_options = parse_arg_array_as_hash(options)
@@ -654,7 +716,10 @@ end
 ##################################### Additional dsl logic
 # Core interpreter for the DSL
 class TemplateDSL < JsonObjectDSL
-  def exec!()
+  def exec!
+    puts cfn(self)
+  end
+  def exec
     cfn(self)
   end
 end
